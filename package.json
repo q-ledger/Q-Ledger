@@ -1,0 +1,13 @@
+{
+  "name": "q-ledger-retrieval",
+  "version": "1.0.0",
+  "description": "Public domain retrieval scripts for Q-Ledger encrypted wallet backups",
+  "license": "CC0-1.0",
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "dependencies": {
+    "@noble/post-quantum": "^0.5.2",
+    "axios": "^1.8.4"
+  }
+}
