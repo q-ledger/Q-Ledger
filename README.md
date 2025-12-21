@@ -281,7 +281,7 @@ We encourage contributions, interoperability, and adoption of Q-Ledger's dual-re
 
 For support or questions:
 - Website: [www.q-ledger.app](https://www.q-ledger.app)
-- Email: [support@q-ledger.app](mailto:support@q-ledger.app)
+- Telegram: [Join our Telegram](https://t.me/+6QS77mPO5V40YjU1)
 
 ---
 
