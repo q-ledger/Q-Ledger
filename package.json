@@ -3,6 +3,10 @@
   "version": "1.0.0",
   "description": "Public domain retrieval scripts for Q-Ledger encrypted wallet backups",
   "license": "CC0-1.0",
+  "scripts": {
+    "retrieve": "node scripts/retrieve.js",
+    "test": "node --test test/*.test.js"
+  },
   "engines": {
     "node": ">=16.0.0"
   },

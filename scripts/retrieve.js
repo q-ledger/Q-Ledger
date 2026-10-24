@@ -15,7 +15,7 @@ const readline = require('readline');
 const {
     loadKeyFile,
     loadMLKEMKey,
-    queryArweaveByUserId,
+    discoverWallets,
     retrieveFromArweave,
     decryptWallet,
     getWalletStatus,
@@ -129,6 +129,9 @@ function displayWalletList(wallets, keyData) {
 
         console.log(`[${num}] ${statusDisplay.padEnd(12)} ${walletName} - ${keyFormat}${dateDisplay}`);
         console.log(`     ${txId}`);
+        if (wallet.fetchError) {
+            console.log(`     ⚠ Could not be fetched yet: ${wallet.fetchError}`);
+        }
         console.log('');
     });
 
@@ -204,14 +207,20 @@ async function main() {
         console.log('Loading Q-Ledger key file...\n');
         const keyData = await loadKeyFile();
 
+        // Load ML-KEM key
+        const mlkemPrivateKey = loadMLKEMKey(keyData);
+
         // Display user identifier
         console.log('User Identifier\n');
         console.log(`User ID: ${keyData.userIdentifier}\n`);
 
         // Query Arweave for wallets
         console.log('Querying Arweave for wallet backups...\n');
-        const wallets = await queryArweaveByUserId(keyData.userIdentifier);
+        const { wallets, ignoredCount } = await discoverWallets(keyData, mlkemPrivateKey);
         console.log(`✓ Found ${wallets.length} wallet(s) on Arweave\n`);
+        if (ignoredCount > 0) {
+            console.log(`  Ignored ${ignoredCount} transaction(s) carrying your User ID that are not encrypted to your key\n`);
+        }
 
         // Display wallet list
         console.log('Wallet List\n');
@@ -259,11 +268,8 @@ async function main() {
         console.log('Fetching and Decrypting Wallet\n');
 
         console.log('Fetching encrypted data from Arweave...');
-        const arweaveData = await retrieveFromArweave(selectedTxId);
+        const arweaveData = selectedWallet.envelope || await retrieveFromArweave(selectedTxId);
         console.log('✓ Data retrieved from Arweave\n');
-
-        // Load ML-KEM key
-        const mlkemPrivateKey = loadMLKEMKey(keyData);
 
         // Decrypt wallet
         console.log('Decrypting wallet...');
