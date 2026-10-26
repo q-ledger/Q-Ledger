@@ -216,7 +216,10 @@ async function main() {
 
         // Query Arweave for wallets
         console.log('Querying Arweave for wallet backups...\n');
-        const { wallets, ignoredCount } = await discoverWallets(keyData, mlkemPrivateKey);
+        const { wallets, ignoredCount, searchError } = await discoverWallets(keyData, mlkemPrivateKey);
+        if (searchError) {
+            console.log(`⚠ Arweave search failed, so only the wallets listed in your key file are shown:\n${searchError}\n`);
+        }
         console.log(`✓ Found ${wallets.length} wallet(s) on Arweave\n`);
         if (ignoredCount > 0) {
             console.log(`  Ignored ${ignoredCount} transaction(s) carrying your User ID that are not encrypted to your key\n`);
