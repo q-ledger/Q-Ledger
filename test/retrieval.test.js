@@ -17,6 +17,7 @@ const {
     loadMLKEMKey,
     mlKemKeyId,
     queryTransactionIdsByUserId,
+    discoverWallets,
     selectUserWallets,
     decryptWallet,
     saveWallet,
@@ -111,27 +112,74 @@ test('keeps only transactions that belong to the user', () => {
     assert.equal(ignoredCount, 5);
 });
 
-test('lists transactions across all pages and fails over to the next gateway', async (t) => {
-    const pages = {
-        null: { edges: [{ cursor: 'c1', node: { id: 'tx1' } }, { cursor: 'c2', node: { id: 'tx2' } }], pageInfo: { hasNextPage: true } },
-        c2: { edges: [{ cursor: 'c3', node: { id: 'tx3' } }], pageInfo: { hasNextPage: false } }
-    };
+function graphqlResponse(edges, hasNextPage) {
+    return { data: { data: { transactions: { edges, pageInfo: { hasNextPage } } } } };
+}
+
+const edge = (id, cursor = id) => ({ cursor, node: { id } });
+
+test('merges transactions from all gateways when one index is incomplete', async (t) => {
+    const [incomplete, complete, failing] = ARWEAVE_GATEWAYS;
     const requests = [];
     t.mock.method(axios, 'post', async (url, body) => {
         requests.push({ url, variables: body.variables });
-        if (url.startsWith(ARWEAVE_GATEWAYS[0])) {
+        if (url.startsWith(incomplete)) {
+            return graphqlResponse([edge('tx1'), edge('tx2')], false);
+        }
+        if (url.startsWith(complete)) {
+            return body.variables.after === null
+                ? graphqlResponse([edge('tx1'), edge('tx2')], true)
+                : graphqlResponse([edge('tx3'), edge('tx4')], false);
+        }
+        if (url.startsWith(failing)) {
             return { data: '' };
         }
-        return { data: { data: { transactions: pages[body.variables.after] } } };
+        throw new Error(`unexpected ${url}`);
     });
 
     const txIds = await queryTransactionIdsByUserId('user-1');
 
-    assert.deepEqual(txIds, ['tx1', 'tx2', 'tx3']);
-    assert.equal(requests.length, 3);
-    assert.ok(requests.slice(1).every(r => r.url === `${ARWEAVE_GATEWAYS[1]}/graphql`));
-    assert.deepEqual(requests[1].variables, { appName: 'Q-Ledger', userId: 'user-1', first: 100, after: null });
-    assert.equal(requests[2].variables.after, 'c2');
+    assert.deepEqual(txIds, ['tx1', 'tx2', 'tx3', 'tx4']);
+    const completeRequests = requests.filter(r => r.url === `${complete}/graphql`);
+    assert.deepEqual(completeRequests.map(r => r.variables.after), [null, 'tx2']);
+    assert.deepEqual(completeRequests[0].variables, { appName: 'Q-Ledger', userId: 'user-1', first: 100, after: null });
+});
+
+test('reports an error only when every gateway fails', async (t) => {
+    t.mock.method(axios, 'post', async () => ({ data: '' }));
+
+    await assert.rejects(() => queryTransactionIdsByUserId('user-1'), /Failed to query Arweave on all gateways/);
+});
+
+test('includes key-file wallets that no gateway search returned', async (t) => {
+    t.mock.method(axios, 'post', async () => graphqlResponse([], false));
+    t.mock.method(axios, 'get', async (url) => {
+        assert.ok(url.endsWith('/listed-tx'), url);
+        return { data: currentEnvelope };
+    });
+    const listed = { ...keyData, wallets: [{ arweaveTransactionId: 'listed-tx' }] };
+
+    const { wallets, searchError } = await discoverWallets(listed, loadMLKEMKey(keyData));
+
+    assert.deepEqual(wallets.map(w => w.txId), ['listed-tx']);
+    assert.equal(searchError, null);
+});
+
+test('falls back to key-file wallets when every search fails', async (t) => {
+    t.mock.method(axios, 'post', async () => ({ data: '' }));
+    t.mock.method(axios, 'get', async () => ({ data: currentEnvelope }));
+    const listed = { ...keyData, wallets: [{ arweaveTransactionId: 'listed-tx' }] };
+
+    const { wallets, searchError } = await discoverWallets(listed, loadMLKEMKey(keyData));
+
+    assert.deepEqual(wallets.map(w => w.txId), ['listed-tx']);
+    assert.match(searchError, /Failed to query Arweave on all gateways/);
+});
+
+test('fails discovery when every search fails and the key file lists no wallets', async (t) => {
+    t.mock.method(axios, 'post', async () => ({ data: '' }));
+
+    await assert.rejects(() => discoverWallets({ ...keyData, wallets: [] }, loadMLKEMKey(keyData)), /all gateways/);
 });
 
 test('saves wallets readable only by the user without overwriting', async (t) => {

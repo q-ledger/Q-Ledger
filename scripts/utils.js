@@ -207,59 +207,85 @@ const USER_TRANSACTIONS_QUERY = `
 `;
 
 /**
- * List the IDs of all Q-Ledger transactions tagged with a UserId, across all result pages
+ * List the IDs of all Q-Ledger transactions tagged with a UserId, across all result pages and gateways
  *
+ * Gateway indexes can be incomplete: one may omit older transactions and still report no further pages.
+ * Every gateway is therefore queried and the results are merged; only if all of them fail is an error thrown.
  * Tags can be set by anyone, so the result may include transactions that are not the user's;
  * use selectUserWallets() to keep only those encrypted to the user's key.
  *
  * @param {string} userId - User identifier (UUID)
- * @returns {Promise<string[]>} - Transaction IDs, newest first
+ * @returns {Promise<string[]>} - Transaction IDs, in the first answering gateway's order (newest first)
  */
 async function queryTransactionIdsByUserId(userId) {
+    const results = await Promise.allSettled(
+        ARWEAVE_GATEWAYS.map(gateway => queryGatewayTransactionIds(gateway, userId))
+    );
+
     const failures = [];
+    const txIds = [];
+    const seen = new Set();
 
-    // Pagination cursors are gateway-specific, so a failing gateway restarts the listing on the next one
-    for (const gateway of ARWEAVE_GATEWAYS) {
-        try {
-            const txIds = [];
-            let after = null;
-
-            do {
-                const response = await axios.post(
-                    `${gateway}/graphql`,
-                    {
-                        query: USER_TRANSACTIONS_QUERY,
-                        variables: { appName: APP_NAME, userId, first: GRAPHQL_PAGE_SIZE, after }
-                    },
-                    {
-                        headers: { 'Content-Type': 'application/json' },
-                        timeout: HTTP_TIMEOUT_MS
-                    }
-                );
-
-                if (response.data?.errors) {
-                    throw new Error(`GraphQL errors: ${JSON.stringify(response.data.errors)}`);
-                }
-
-                const transactions = response.data?.data?.transactions;
-                if (!transactions) {
-                    throw new Error('Empty GraphQL response');
-                }
-
-                txIds.push(...transactions.edges.map(edge => edge.node.id));
-
-                const lastEdge = transactions.edges[transactions.edges.length - 1];
-                after = transactions.pageInfo?.hasNextPage && lastEdge ? lastEdge.cursor : null;
-            } while (after);
-
-            return txIds;
-
-        } catch (error) {
-            failures.push(`${gateway}: ${describeRequestError(error)}`);
+    results.forEach((result, index) => {
+        if (result.status === 'rejected') {
+            failures.push(`${ARWEAVE_GATEWAYS[index]}: ${describeRequestError(result.reason)}`);
+            return;
         }
+        for (const txId of result.value) {
+            if (!seen.has(txId)) {
+                seen.add(txId);
+                txIds.push(txId);
+            }
+        }
+    });
+
+    if (failures.length === ARWEAVE_GATEWAYS.length) {
+        throw new Error(`Failed to query Arweave on all gateways:\n  ${failures.join('\n  ')}`);
     }
 
-    throw new Error(`Failed to query Arweave on all gateways:\n  ${failures.join('\n  ')}`);
+    return txIds;
+}
+
+/**
+ * List all matching transaction IDs from one gateway, following its pagination cursors
+ *
+ * @param {string} gateway - Gateway base URL
+ * @param {string} userId - User identifier (UUID)
+ * @returns {Promise<string[]>} - Transaction IDs
+ */
+async function queryGatewayTransactionIds(gateway, userId) {
+    const txIds = [];
+    let after = null;
+
+    do {
+        const response = await axios.post(
+            `${gateway}/graphql`,
+            {
+                query: USER_TRANSACTIONS_QUERY,
+                variables: { appName: APP_NAME, userId, first: GRAPHQL_PAGE_SIZE, after }
+            },
+            {
+                headers: { 'Content-Type': 'application/json' },
+                timeout: HTTP_TIMEOUT_MS
+            }
+        );
+
+        if (response.data?.errors) {
+            throw new Error(`GraphQL errors: ${JSON.stringify(response.data.errors)}`);
+        }
+
+        const transactions = response.data?.data?.transactions;
+        if (!transactions) {
+            throw new Error('Empty GraphQL response');
+        }
+
+        txIds.push(...transactions.edges.map(edge => edge.node.id));
+
+        const lastEdge = transactions.edges[transactions.edges.length - 1];
+        after = transactions.pageInfo?.hasNextPage && lastEdge ? lastEdge.cursor : null;
+    } while (after);
+
+    return txIds;
 }
 
 /**
@@ -267,10 +293,26 @@ async function queryTransactionIdsByUserId(userId) {
  *
  * @param {object} keyData - Parsed key file data
  * @param {Uint8Array} mlkemPrivateKey - ML-KEM-768 private key
- * @returns {Promise<{wallets: Array, ignoredCount: number}>} - The user's wallets and the number of unrelated transactions skipped
+ * @returns {Promise<{wallets: Array, ignoredCount: number, searchError: string|null}>} - The user's wallets, the number of
+ *   unrelated transactions skipped, and why the search failed if only key-file wallets could be listed
  */
 async function discoverWallets(keyData, mlkemPrivateKey) {
-    const txIds = await queryTransactionIdsByUserId(keyData.userIdentifier);
+    // Wallets listed in the key file are fetched by ID even if no gateway's search returned them
+    const keyFileTxIds = (keyData.wallets || []).map(w => w.arweaveTransactionId).filter(Boolean);
+
+    let searchedTxIds = [];
+    let searchError = null;
+    try {
+        searchedTxIds = await queryTransactionIdsByUserId(keyData.userIdentifier);
+    } catch (error) {
+        if (keyFileTxIds.length === 0) {
+            throw error;
+        }
+        searchError = error.message;
+    }
+
+    const txIds = [...new Set([...searchedTxIds, ...keyFileTxIds])];
+
     const fetched = await mapWithConcurrency(txIds, FETCH_CONCURRENCY, async (txId) => {
         try {
             return { txId, envelope: await retrieveFromArweave(txId) };
@@ -279,7 +321,7 @@ async function discoverWallets(keyData, mlkemPrivateKey) {
         }
     });
 
-    return selectUserWallets(fetched, mlkemPrivateKey, keyData);
+    return { ...selectUserWallets(fetched, mlkemPrivateKey, keyData), searchError };
 }
 
 /**

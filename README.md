@@ -57,7 +57,8 @@ The retrieval script (`scripts/retrieve.js`) provides:
 ### Automatic Discovery
 - Queries Arweave's GraphQL endpoint for all your wallet backups, across every result page
 - Keeps only backups listed in your key file or that decrypt with your own ML-KEM-768 key, so transactions that merely copy your User ID tag are ignored
-- Tries several Arweave gateways in turn, so one unavailable gateway does not block recovery
+- Queries several Arweave gateways and merges their results, because a single gateway's index can be incomplete or unavailable
+- Always includes the wallets listed in your key file, fetched by ID, even if no search returns them
 - Displays wallets with status: **Active**, **Revoked**, or **Recovered**
 - Shows wallet names, creation dates, and formats from your key file
 
@@ -198,7 +199,7 @@ The script will guide you through the interactive retrieval process.
 
 ### Customizing Arweave Gateways (Optional)
 
-The tool tries these gateways in order and moves to the next one when a gateway fails:
+The tool searches all of these gateways and merges the results; wallet data is fetched from the first gateway that serves it:
 - `https://arweave.net`
 - `https://turbo-gateway.com`
 - `https://ar-io.dev`
