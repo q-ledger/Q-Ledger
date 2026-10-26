@@ -252,15 +252,27 @@ If retrieving on a potentially compromised device:
 
 **Solution:** Verify you've backed up wallets in Q-Ledger app and wait a few minutes for Arweave indexing.
 
+### "Ignored N transaction(s) carrying your User ID that are not encrypted to your key"
+
+**Cause:** Anyone can upload data to Arweave with your User ID as a tag. The tool keeps only the backups that your key file lists or that decrypt with the ML-KEM-768 key in it.
+
+**Solution:** None needed. Your own wallets are still shown.
+
+### "Could not be fetched yet"
+
+**Cause:** A wallet was found, but none of the Arweave gateways returned its data. The transaction is usually still being confirmed, or the gateways are temporarily unavailable.
+
+**Solution:** Wait 5-10 minutes and run the tool again. The wallet stays in the list, so you can also select it and retry.
+
 ### "Transaction not found"
 
 **Possible causes:**
 - Transaction not yet confirmed on Arweave
 - Temporary gateway issue
 
-**Solution:** Wait 5-10 minutes for confirmation or try again later. If persisting, the Arweave gateway may be slow.
+**Solution:** Wait 5-10 minutes for confirmation or try again later. The tool already tries several gateways; if every one fails, Arweave may be slow.
 
-### "Failed to decrypt symmetric key"
+### "Failed to decrypt wallet: it is not encrypted to the ML-KEM-768 key in this key file"
 
 **Possible causes:**
 - Wrong ML-KEM private key
@@ -296,7 +308,7 @@ If retrieving on a potentially compromised device:
   - Backed up from a different device
   - Old backup before you revoked/deleted the wallet
   - Restored key file from an earlier date
-- **Caution:** Verify these are actually your wallets before retrieving
+- Only listed when they decrypt with the ML-KEM-768 key in your key file, so they cannot have been planted by someone else. The one exception is a wallet marked "Could not be fetched yet": it can't be checked until its data loads.
 
 ---
 

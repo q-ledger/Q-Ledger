@@ -18,17 +18,42 @@ const { ml_kem768 } = require('@noble/post-quantum/ml-kem.js');
 // ============================================================================
 
 // Arweave Configuration
-// To use a different Arweave gateway, modify the ARWEAVE_GATEWAY constant below
-const ARWEAVE_GATEWAY = 'https://arweave.net';
-const ARWEAVE_GRAPHQL = `${ARWEAVE_GATEWAY}/graphql`;
-const MAX_GRAPHQL_RESULTS = 100;
+// Gateways are tried in order; to add or prefer a gateway, edit this list
+const ARWEAVE_GATEWAYS = [
+    'https://arweave.net',
+    'https://turbo-gateway.com',
+    'https://ar-io.dev'
+];
+const APP_NAME = 'Q-Ledger';
+const GRAPHQL_PAGE_SIZE = 100;
 const HTTP_TIMEOUT_MS = 30000;
+const FETCH_CONCURRENCY = 8;
 
 // Cryptographic Constants
 const ML_KEM_768_PRIVATE_KEY_LENGTH = 2400;
+const ML_KEM_768_PUBLIC_KEY_OFFSET = 1152;
+const ML_KEM_768_PUBLIC_KEY_LENGTH = 1184;
+const ML_KEM_768_RECIPIENT_TYPE = 'ML-KEM-768';
+const KEY_FINGERPRINT_LENGTH = 8;
 const SHA256_OUTPUT_LENGTH = 32;
 const GCM_NONCE_LENGTH = 12;
 const GCM_TAG_LENGTH = 16;
+
+// Envelope formats, newest first. On 2025-11-16 the iOS app appended
+// "|alg=AES-256-GCM" to both the key-wrap HKDF info and the payload AAD;
+// wallets stored before that date use the legacy strings.
+const ENVELOPE_FORMATS = [
+    {
+        name: 'current',
+        wrapInfo: (kid) => `wrap|v=1|kid=${kid}|alg=AES-256-GCM`,
+        payloadAAD: (version, recipients) => `v=${version}|alg=AES-256-GCM|recipients=${recipients}`
+    },
+    {
+        name: 'legacy',
+        wrapInfo: (kid) => `wrap|v=1|kid=${kid}`,
+        payloadAAD: (version, recipients) => `v=${version}|recipients=${recipients}`
+    }
+];
 
 // File System Constants
 const MAX_FILENAME_LENGTH = 50;
@@ -74,7 +99,7 @@ async function loadKeyFile() {
         const keyData = JSON.parse(fileContent);
 
         // Validate key file structure
-        if (!keyData.appName || keyData.appName !== 'Q-Ledger') {
+        if (!keyData.appName || keyData.appName !== APP_NAME) {
             throw new Error('Invalid key file: not a Q-Ledger key file');
         }
 
@@ -116,86 +141,215 @@ function loadMLKEMKey(keyData) {
         throw new Error(`Invalid ML-KEM-768 private key length: ${privateKeyBytes.length} (expected ${ML_KEM_768_PRIVATE_KEY_LENGTH})`);
     }
 
+    // FIPS 203 private keys embed the public key followed by its SHA3-256 hash
+    const embeddedHash = privateKeyBytes.subarray(
+        ML_KEM_768_PUBLIC_KEY_OFFSET + ML_KEM_768_PUBLIC_KEY_LENGTH,
+        ML_KEM_768_PUBLIC_KEY_OFFSET + ML_KEM_768_PUBLIC_KEY_LENGTH + SHA256_OUTPUT_LENGTH
+    );
+    const publicKeyHash = crypto.createHash('sha3-256').update(extractMLKEMPublicKey(privateKeyBytes)).digest();
+    if (!publicKeyHash.equals(embeddedHash)) {
+        throw new Error('Invalid ML-KEM-768 private key: integrity check failed (the key file is damaged)');
+    }
+
     return new Uint8Array(privateKeyBytes);
+}
+
+/**
+ * Extract the ML-KEM-768 public key embedded in a FIPS 203 private key
+ *
+ * @param {Uint8Array} privateKey - ML-KEM-768 private key (2400 bytes)
+ * @returns {Buffer} - ML-KEM-768 public key (1184 bytes)
+ */
+function extractMLKEMPublicKey(privateKey) {
+    return Buffer.from(privateKey).subarray(
+        ML_KEM_768_PUBLIC_KEY_OFFSET,
+        ML_KEM_768_PUBLIC_KEY_OFFSET + ML_KEM_768_PUBLIC_KEY_LENGTH
+    );
+}
+
+/**
+ * Compute the recipient key identifier ("kid") the app writes for an ML-KEM-768 key
+ * Format: "ML-KEM-768:" + hex(first 8 bytes of SHA-256(public key))
+ *
+ * @param {Uint8Array} privateKey - ML-KEM-768 private key (2400 bytes)
+ * @returns {string} - Key identifier
+ */
+function mlKemKeyId(privateKey) {
+    const fingerprint = crypto.createHash('sha256').update(extractMLKEMPublicKey(privateKey)).digest();
+    return `${ML_KEM_768_RECIPIENT_TYPE}:${fingerprint.subarray(0, KEY_FINGERPRINT_LENGTH).toString('hex')}`;
 }
 
 // ============================================================================
 // ARWEAVE GRAPHQL QUERIES
 // ============================================================================
 
-/**
- * Query Arweave GraphQL for all transactions with a specific UserId tag
- *
- * @param {string} userId - User identifier (UUID)
- * @returns {Promise<Array>} - Array of wallet objects with txId and metadata
- */
-async function queryArweaveByUserId(userId) {
-    const query = `
-        query {
-            transactions(
-                tags: [
-                    { name: "UserId", values: ["${userId}"] }
-                ],
-                first: ${MAX_GRAPHQL_RESULTS}
-            ) {
-                edges {
-                    node {
-                        id
-                        tags {
-                            name
-                            value
-                        }
-                    }
+const USER_TRANSACTIONS_QUERY = `
+    query ($appName: String!, $userId: String!, $first: Int!, $after: String) {
+        transactions(
+            tags: [
+                { name: "App-Name", values: [$appName] },
+                { name: "UserId", values: [$userId] }
+            ],
+            first: $first,
+            after: $after
+        ) {
+            pageInfo {
+                hasNextPage
+            }
+            edges {
+                cursor
+                node {
+                    id
                 }
             }
         }
-    `;
+    }
+`;
 
-    try {
-        const response = await axios.post(
-            ARWEAVE_GRAPHQL,
-            { query },
-            {
-                headers: { 'Content-Type': 'application/json' },
-                timeout: HTTP_TIMEOUT_MS
-            }
-        );
+/**
+ * List the IDs of all Q-Ledger transactions tagged with a UserId, across all result pages
+ *
+ * Tags can be set by anyone, so the result may include transactions that are not the user's;
+ * use selectUserWallets() to keep only those encrypted to the user's key.
+ *
+ * @param {string} userId - User identifier (UUID)
+ * @returns {Promise<string[]>} - Transaction IDs, newest first
+ */
+async function queryTransactionIdsByUserId(userId) {
+    const failures = [];
 
-        if (response.data.errors) {
-            throw new Error(`GraphQL errors: ${JSON.stringify(response.data.errors)}`);
-        }
+    // Pagination cursors are gateway-specific, so a failing gateway restarts the listing on the next one
+    for (const gateway of ARWEAVE_GATEWAYS) {
+        try {
+            const txIds = [];
+            let after = null;
 
-        const edges = response.data.data.transactions.edges;
+            do {
+                const response = await axios.post(
+                    `${gateway}/graphql`,
+                    {
+                        query: USER_TRANSACTIONS_QUERY,
+                        variables: { appName: APP_NAME, userId, first: GRAPHQL_PAGE_SIZE, after }
+                    },
+                    {
+                        headers: { 'Content-Type': 'application/json' },
+                        timeout: HTTP_TIMEOUT_MS
+                    }
+                );
 
-        // Fetch metadata for all transactions in parallel
-        const walletPromises = edges.map(async (edge) => {
-            const txId = edge.node.id;
+                if (response.data?.errors) {
+                    throw new Error(`GraphQL errors: ${JSON.stringify(response.data.errors)}`);
+                }
 
-            try {
-                // Fetch transaction data to retrieve metadata
-                const txData = await retrieveFromArweave(txId);
-                const metadata = txData.metadata || null;
+                const transactions = response.data?.data?.transactions;
+                if (!transactions) {
+                    throw new Error('Empty GraphQL response');
+                }
 
-                return { txId, metadata };
-            } catch (error) {
-                // Add transaction without metadata if retrieval fails
-                console.warn(`Warning: Could not fetch metadata for ${txId}: ${error.message}`);
-                return { txId, metadata: null };
-            }
-        });
+                txIds.push(...transactions.edges.map(edge => edge.node.id));
 
-        const wallets = await Promise.all(walletPromises);
-        return wallets;
+                const lastEdge = transactions.edges[transactions.edges.length - 1];
+                after = transactions.pageInfo?.hasNextPage && lastEdge ? lastEdge.cursor : null;
+            } while (after);
 
-    } catch (error) {
-        if (error.response) {
-            throw new Error(`Arweave GraphQL error: ${error.response.status} ${error.response.statusText}`);
-        } else if (error.code === 'ECONNABORTED') {
-            throw new Error('Request timed out. Please check your internet connection.');
-        } else {
-            throw new Error(`Failed to query Arweave: ${error.message}`);
+            return txIds;
+
+        } catch (error) {
+            failures.push(`${gateway}: ${describeRequestError(error)}`);
         }
     }
+
+    throw new Error(`Failed to query Arweave on all gateways:\n  ${failures.join('\n  ')}`);
+}
+
+/**
+ * Discover the user's wallets on Arweave
+ *
+ * @param {object} keyData - Parsed key file data
+ * @param {Uint8Array} mlkemPrivateKey - ML-KEM-768 private key
+ * @returns {Promise<{wallets: Array, ignoredCount: number}>} - The user's wallets and the number of unrelated transactions skipped
+ */
+async function discoverWallets(keyData, mlkemPrivateKey) {
+    const txIds = await queryTransactionIdsByUserId(keyData.userIdentifier);
+    const fetched = await mapWithConcurrency(txIds, FETCH_CONCURRENCY, async (txId) => {
+        try {
+            return { txId, envelope: await retrieveFromArweave(txId) };
+        } catch (error) {
+            return { txId, envelope: null, error: error.message };
+        }
+    });
+
+    return selectUserWallets(fetched, mlkemPrivateKey, keyData);
+}
+
+/**
+ * Keep only the transactions that belong to the user
+ *
+ * Anyone can upload data carrying the user's UserId tag, and recipient key identifiers are public,
+ * so a transaction absent from the key file is accepted only if it decrypts with the user's key.
+ * Without the user's public key (which is never published) nobody else can produce such a backup.
+ * Transactions that could not be fetched are kept so a gateway error never hides a wallet.
+ *
+ * @param {Array} fetched - Objects with txId, envelope (or null) and optional error
+ * @param {Uint8Array} mlkemPrivateKey - ML-KEM-768 private key
+ * @param {object} keyData - Parsed key file data
+ * @returns {{wallets: Array, ignoredCount: number}}
+ */
+function selectUserWallets(fetched, mlkemPrivateKey, keyData) {
+    const knownTxIds = new Set((keyData.wallets || []).map(w => w.arweaveTransactionId));
+    const expectedKid = mlKemKeyId(mlkemPrivateKey);
+    const wallets = [];
+    let ignoredCount = 0;
+
+    for (const { txId, envelope, error } of fetched) {
+        if (!envelope) {
+            wallets.push({ txId, metadata: null, envelope: null, fetchError: error || 'Unknown error' });
+        } else if (knownTxIds.has(txId) || isEncryptedToKey(envelope, expectedKid, mlkemPrivateKey)) {
+            const metadata = envelope.metadata && typeof envelope.metadata === 'object' ? envelope.metadata : null;
+            wallets.push({ txId, metadata, envelope });
+        } else {
+            ignoredCount++;
+        }
+    }
+
+    return { wallets, ignoredCount };
+}
+
+/**
+ * Check that an envelope authenticates under the user's ML-KEM-768 key
+ *
+ * @param {object} envelope - Data from Arweave (untrusted)
+ * @param {string} expectedKid - The user's ML-KEM-768 key identifier
+ * @param {Uint8Array} mlkemPrivateKey - ML-KEM-768 private key
+ * @returns {boolean} - True if the envelope decrypts with the key
+ */
+function isEncryptedToKey(envelope, expectedKid, mlkemPrivateKey) {
+    if (!findMLKEMRecipient(envelope, expectedKid)) {
+        return false;
+    }
+
+    try {
+        decryptWallet(envelope, mlkemPrivateKey);
+        return true;
+    } catch (error) {
+        return false;
+    }
+}
+
+/**
+ * Find the ML-KEM-768 recipient entry in an envelope
+ *
+ * @param {object} envelope - Data from Arweave (untrusted)
+ * @param {string} [kid] - Only match a recipient with this key identifier
+ * @returns {object|undefined} - Recipient entry
+ */
+function findMLKEMRecipient(envelope, kid) {
+    if (!envelope || !Array.isArray(envelope.recipients)) {
+        return undefined;
+    }
+    return envelope.recipients.find(r =>
+        r && typeof r === 'object' && r.type === ML_KEM_768_RECIPIENT_TYPE && (kid === undefined || r.kid === kid)
+    );
 }
 
 // ============================================================================
@@ -214,35 +368,70 @@ async function retrieveFromArweave(txId) {
     }
 
     txId = txId.trim();
+    const failures = [];
 
-    try {
-        const url = `${ARWEAVE_GATEWAY}/${txId}`;
-        const response = await axios.get(url, {
-            timeout: HTTP_TIMEOUT_MS,
-            headers: { 'Accept': 'application/json' }
-        });
+    for (const gateway of ARWEAVE_GATEWAYS) {
+        try {
+            const response = await axios.get(`${gateway}/${txId}`, {
+                timeout: HTTP_TIMEOUT_MS,
+                headers: { 'Accept': 'application/json' }
+            });
 
-        if (!response.data) {
-            throw new Error('No data returned from Arweave');
-        }
-
-        return response.data;
-
-    } catch (error) {
-        if (error.response) {
-            if (error.response.status === 404) {
-                throw new Error(`Transaction not found: ${txId}`);
-            } else if (error.response.status === 429) {
-                throw new Error('Rate limit exceeded. Please wait and try again.');
-            } else {
-                throw new Error(`Arweave error ${error.response.status}: ${error.response.statusText}`);
+            if (!response.data || typeof response.data !== 'object') {
+                throw new Error('No data returned from Arweave');
             }
-        } else if (error.code === 'ECONNABORTED') {
-            throw new Error('Request timed out. Check your connection and try again.');
-        } else {
-            throw new Error(`Failed to retrieve from Arweave: ${error.message}`);
+
+            return response.data;
+
+        } catch (error) {
+            failures.push(`${gateway}: ${describeRequestError(error)}`);
         }
     }
+
+    throw new Error(`Failed to retrieve ${txId} from all gateways:\n  ${failures.join('\n  ')}`);
+}
+
+/**
+ * Describe an HTTP request failure in user-facing terms
+ *
+ * @param {Error} error - Axios or other error
+ * @returns {string} - Description
+ */
+function describeRequestError(error) {
+    if (error.response) {
+        if (error.response.status === 404) {
+            return 'Transaction not found (it may not be indexed yet)';
+        } else if (error.response.status === 429) {
+            return 'Rate limit exceeded';
+        }
+        return `HTTP ${error.response.status} ${error.response.statusText}`;
+    } else if (error.code === 'ECONNABORTED') {
+        return 'Request timed out';
+    }
+    return error.message;
+}
+
+/**
+ * Map over items with at most `limit` promises in flight, preserving order
+ *
+ * @param {Array} items - Items to process
+ * @param {number} limit - Maximum concurrent operations
+ * @param {Function} fn - Async mapping function
+ * @returns {Promise<Array>} - Results in input order
+ */
+async function mapWithConcurrency(items, limit, fn) {
+    const results = new Array(items.length);
+    let next = 0;
+
+    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (next < items.length) {
+            const index = next++;
+            results[index] = await fn(items[index]);
+        }
+    });
+
+    await Promise.all(workers);
+    return results;
 }
 
 // ============================================================================
@@ -285,48 +474,42 @@ function hkdf(ikm, salt, info, length) {
  * @param {Buffer} encapsulatedKey - ML-KEM encapsulated key
  * @param {object} recipient - Recipient metadata (must include salt, recV, kid, type)
  * @param {Uint8Array} privateKey - ML-KEM-768 private key
+ * @param {object} format - Entry of ENVELOPE_FORMATS
  * @returns {Buffer} - Decrypted symmetric key (32 bytes for AES-256)
  */
-function decryptSymmetricKey(wrappedKey, encapsulatedKey, recipient, privateKey) {
-    try {
-        // Step 1: Decapsulate to get shared secret (quantum-safe KEM)
-        const sharedSecret = ml_kem768.decapsulate(encapsulatedKey, privateKey);
+function decryptSymmetricKey(wrappedKey, encapsulatedKey, recipient, privateKey, format) {
+    // Step 1: Decapsulate to get shared secret (quantum-safe KEM)
+    const sharedSecret = ml_kem768.decapsulate(encapsulatedKey, privateKey);
 
-        // Step 2: Derive encryption key using HKDF-SHA256
-        // Format: "wrap|v=1|kid={kid}" (from QSCryptionManager.swift line 188)
-        const info = Buffer.from(`wrap|v=1|kid=${recipient.kid}`, 'utf8');
-        const salt = Buffer.from(recipient.salt, 'base64');
-        const encryptionKey = hkdf(Buffer.from(sharedSecret), salt, info, 32);
+    // Step 2: Derive encryption key using HKDF-SHA256
+    const info = Buffer.from(format.wrapInfo(recipient.kid), 'utf8');
+    const salt = Buffer.from(recipient.salt, 'base64');
+    const encryptionKey = hkdf(Buffer.from(sharedSecret), salt, info, 32);
 
-        // Step 3: Extract nonce, tag, and ciphertext from wrapped key
-        const nonce = wrappedKey.subarray(0, GCM_NONCE_LENGTH);
-        const tag = wrappedKey.subarray(-GCM_TAG_LENGTH);
-        const ciphertext = wrappedKey.subarray(GCM_NONCE_LENGTH, -GCM_TAG_LENGTH);
+    // Step 3: Extract nonce, tag, and ciphertext from wrapped key
+    const nonce = wrappedKey.subarray(0, GCM_NONCE_LENGTH);
+    const tag = wrappedKey.subarray(-GCM_TAG_LENGTH);
+    const ciphertext = wrappedKey.subarray(GCM_NONCE_LENGTH, -GCM_TAG_LENGTH);
 
-        // Step 4: Build AAD (Additional Authenticated Data)
-        // Format: "recV={recV}|kid={kid}|type={type}|kem_hash={kemHash}|nonce={wrapNonce}"
-        // (from QSCryptionManager.swift line 309)
-        const kemHash = crypto.createHash('sha256').update(encapsulatedKey).digest();
-        const kemHashB64 = kemHash.toString('base64');
-        const wrapNonceB64 = nonce.toString('base64');
-        const aad = Buffer.from(
-            `recV=${recipient.recV}|kid=${recipient.kid}|type=${recipient.type}|kem_hash=${kemHashB64}|nonce=${wrapNonceB64}`,
-            'utf8'
-        );
+    // Step 4: Build AAD (Additional Authenticated Data)
+    // Format: "recV={recV}|kid={kid}|type={type}|kem_hash={kemHash}|nonce={wrapNonce}"
+    const kemHash = crypto.createHash('sha256').update(encapsulatedKey).digest();
+    const kemHashB64 = kemHash.toString('base64');
+    const wrapNonceB64 = nonce.toString('base64');
+    const aad = Buffer.from(
+        `recV=${recipient.recV}|kid=${recipient.kid}|type=${recipient.type}|kem_hash=${kemHashB64}|nonce=${wrapNonceB64}`,
+        'utf8'
+    );
 
-        // Step 5: Decrypt using AES-256-GCM
-        const decipher = crypto.createDecipheriv('aes-256-gcm', encryptionKey, nonce);
-        decipher.setAuthTag(tag);
-        decipher.setAAD(aad);
+    // Step 5: Decrypt using AES-256-GCM
+    const decipher = crypto.createDecipheriv('aes-256-gcm', encryptionKey, nonce);
+    decipher.setAuthTag(tag);
+    decipher.setAAD(aad);
 
-        let decrypted = decipher.update(ciphertext);
-        decrypted = Buffer.concat([decrypted, decipher.final()]);
+    let decrypted = decipher.update(ciphertext);
+    decrypted = Buffer.concat([decrypted, decipher.final()]);
 
-        return decrypted;
-
-    } catch (error) {
-        throw new Error(`Failed to decrypt symmetric key: ${error.message}`);
-    }
+    return decrypted;
 }
 
 /**
@@ -334,38 +517,28 @@ function decryptSymmetricKey(wrappedKey, encapsulatedKey, recipient, privateKey)
  *
  * @param {object} arweaveData - DualRecipientEncryptedData from Arweave
  * @param {Buffer} symmetricKey - Decrypted AES-256 symmetric key
+ * @param {object} format - Entry of ENVELOPE_FORMATS
  * @returns {Buffer} - Decrypted wallet data
  */
-function decryptWalletPayload(arweaveData, symmetricKey) {
-    try {
-        const version = arweaveData.version;
-        const recipientCount = arweaveData.recipients.length;
+function decryptWalletPayload(arweaveData, symmetricKey, format) {
+    const payloadAAD = Buffer.from(
+        format.payloadAAD(arweaveData.version, arweaveData.recipients.length),
+        'utf8'
+    );
 
-        // Build AAD for payload decryption
-        // Format: "v={version}|recipients={recipients}"
-        // (from QSCryptionManager.swift line 305)
-        const payloadAAD = Buffer.from(
-            `v=${version}|recipients=${recipientCount}`,
-            'utf8'
-        );
+    const ciphertext = Buffer.from(arweaveData.ciphertext, 'base64');
+    const nonce = Buffer.from(arweaveData.nonce, 'base64');
+    const tag = Buffer.from(arweaveData.tag, 'base64');
 
-        const ciphertext = Buffer.from(arweaveData.ciphertext, 'base64');
-        const nonce = Buffer.from(arweaveData.nonce, 'base64');
-        const tag = Buffer.from(arweaveData.tag, 'base64');
+    // Decrypt using AES-256-GCM
+    const decipher = crypto.createDecipheriv('aes-256-gcm', symmetricKey, nonce);
+    decipher.setAuthTag(tag);
+    decipher.setAAD(payloadAAD);
 
-        // Decrypt using AES-256-GCM
-        const decipher = crypto.createDecipheriv('aes-256-gcm', symmetricKey, nonce);
-        decipher.setAuthTag(tag);
-        decipher.setAAD(payloadAAD);
+    let decrypted = decipher.update(ciphertext);
+    decrypted = Buffer.concat([decrypted, decipher.final()]);
 
-        let decrypted = decipher.update(ciphertext);
-        decrypted = Buffer.concat([decrypted, decipher.final()]);
-
-        return decrypted;
-
-    } catch (error) {
-        throw new Error(`Failed to decrypt wallet payload: ${error.message}`);
-    }
+    return decrypted;
 }
 
 /**
@@ -375,10 +548,7 @@ function decryptWalletPayload(arweaveData, symmetricKey) {
  * @returns {boolean} - True if wallet has ML-KEM-768 recipient
  */
 function hasMLKEMRecipient(arweaveData) {
-    if (!arweaveData.recipients || !Array.isArray(arweaveData.recipients)) {
-        return false;
-    }
-    return arweaveData.recipients.some(r => r.type === 'ML-KEM-768');
+    return findMLKEMRecipient(arweaveData) !== undefined;
 }
 
 /**
@@ -390,12 +560,11 @@ function hasMLKEMRecipient(arweaveData) {
  */
 function decryptWallet(arweaveData, mlkemPrivateKey) {
     // Find ML-KEM-768 recipient
-    const mlkemRecipient = arweaveData.recipients.find(r => r.type === 'ML-KEM-768');
+    const mlkemRecipient = findMLKEMRecipient(arweaveData);
     if (!mlkemRecipient) {
         throw new Error('No ML-KEM-768 recipient found. This wallet was created with Q-Ledger Standard (non-Pro) version and can only be decrypted in the Q-Ledger iOS app.');
     }
 
-    // Decrypt the symmetric key
     const wrappedKey = Buffer.from(mlkemRecipient.wrappedK, 'base64');
     const encapsulatedKey = Buffer.from(mlkemRecipient.kem_ct, 'base64');
 
@@ -406,12 +575,23 @@ function decryptWallet(arweaveData, mlkemPrivateKey) {
         salt: mlkemRecipient.salt
     };
 
-    const symmetricKey = decryptSymmetricKey(wrappedKey, encapsulatedKey, recipient, mlkemPrivateKey);
+    // Authenticated decryption fails for every format except the one the wallet was written in
+    for (const format of ENVELOPE_FORMATS) {
+        let symmetricKey;
+        try {
+            symmetricKey = decryptSymmetricKey(wrappedKey, encapsulatedKey, recipient, mlkemPrivateKey, format);
+        } catch (error) {
+            continue;
+        }
 
-    // Decrypt the wallet payload
-    const decryptedWallet = decryptWalletPayload(arweaveData, symmetricKey);
+        try {
+            return decryptWalletPayload(arweaveData, symmetricKey, format);
+        } catch (error) {
+            throw new Error(`Failed to decrypt wallet payload: the data is damaged (${error.message})`);
+        }
+    }
 
-    return decryptedWallet;
+    throw new Error('Failed to decrypt wallet: it is not encrypted to the ML-KEM-768 key in this key file, or the data is damaged.');
 }
 
 // ============================================================================
@@ -542,6 +722,9 @@ function determineFileExtension(walletData, keyFormat) {
 /**
  * Save decrypted wallet to file
  *
+ * The file is readable only by the current user and never overwrites an existing file;
+ * wallets with the same name are saved as name-2, name-3, and so on.
+ *
  * @param {Buffer} walletData - Decrypted wallet data
  * @param {string} walletName - Wallet name for filename
  * @param {string} keyFormat - Key format from metadata (optional)
@@ -555,20 +738,30 @@ async function saveWallet(walletData, walletName, keyFormat) {
     const sanitizedName = walletName
         .replace(/[^a-zA-Z0-9-_\s]/g, '_')  // Replace invalid chars with underscore
         .replace(/\s+/g, '_')                // Replace spaces with underscore
-        .substring(0, MAX_FILENAME_LENGTH);  // Limit length for filesystem compatibility
+        .substring(0, MAX_FILENAME_LENGTH)   // Limit length for filesystem compatibility
+        || 'wallet';
 
-    const filename = `${sanitizedName}.${extension}`;
     const walletsDir = path.join(process.cwd(), 'wallets');
-    const outputPath = path.join(walletsDir, filename);
 
     // Ensure directory exists
-    await fs.mkdir(walletsDir, { recursive: true });
+    await fs.mkdir(walletsDir, { recursive: true, mode: 0o700 });
 
-    // Write file
-    await fs.writeFile(outputPath, walletData);
+    for (let copy = 1; ; copy++) {
+        const filename = copy === 1 ? `${sanitizedName}.${extension}` : `${sanitizedName}-${copy}.${extension}`;
+        const outputPath = path.join(walletsDir, filename);
 
-    console.log(`✓ Wallet saved to: ${outputPath}\n`);
-    return outputPath;
+        try {
+            await fs.writeFile(outputPath, walletData, { flag: 'wx', mode: 0o600 });
+        } catch (error) {
+            if (error.code === 'EEXIST') {
+                continue;
+            }
+            throw error;
+        }
+
+        console.log(`✓ Wallet saved to: ${outputPath}\n`);
+        return outputPath;
+    }
 }
 
 // ============================================================================
@@ -579,9 +772,12 @@ module.exports = {
     // Key management
     loadKeyFile,
     loadMLKEMKey,
+    mlKemKeyId,
 
     // Arweave
-    queryArweaveByUserId,
+    queryTransactionIdsByUserId,
+    discoverWallets,
+    selectUserWallets,
     retrieveFromArweave,
 
     // Decryption
@@ -596,5 +792,5 @@ module.exports = {
     saveWallet,
 
     // Constants
-    ARWEAVE_GATEWAY
+    ARWEAVE_GATEWAYS
 };
